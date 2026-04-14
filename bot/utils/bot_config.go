@@ -80,3 +80,5 @@ func (bot *MyBot) SendRandomText(phoneNumber string) {
 
     bot.WAClient.SendMessage(context.Background(), jid, msg)
 }
+
+

@@ -6,13 +6,16 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"strconv"
-	
+	"time"
+
+	"github.com/joho/godotenv"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal/v3"
 
-    _ "github.com/mattn/go-sqlite3"
+	"my-whatsapp-bot/bot/utils"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -21,48 +24,61 @@ import (
 func eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
-		fmt.Println("Received a message!", v.Message.GetConversation())
+		fmt.Println("Received a message:", v.Message.GetConversation())
 	}
 }
 
 func main() {
-	if len(os.Args) < 2 {
-        fmt.Println("Ошибка: укажите account_id (например: go run . 1)")
-        return
-    }
+	_ = godotenv.Load()
 
-    accountIDStr := os.Args[1]
+	err := os.MkdirAll("sessions", os.ModePerm)
+	if err != nil {
+		panic(err)
+	}
 
-    accountID, err := strconv.Atoi(accountIDStr)
-    if err != nil {
-        fmt.Println("Ошибка: account_id должен быть числом")
-        return
-    }
-
-	dbPath := fmt.Sprintf("file:sessions/account_%d.sqlite3?_foreign_keys=on", accountID)
-
-	dbLog := waLog.Stdout("Database", "INFO", true)
 	ctx := context.Background()
+
+	dbPath := "file:sessions/multi.db?_foreign_keys=on"
+	dbLog := waLog.Stdout("Database", "INFO", true)
+
 	container, err := sqlstore.New(ctx, "sqlite3", dbPath, dbLog)
 	if err != nil {
 		panic(err)
 	}
-	// If you want multiple sessions, remember their JIDs and use .GetDevice(jid) or .GetAllDevices() instead.
-	deviceStore, err := container.GetFirstDevice(ctx)
+
+	devices, err := container.GetAllDevices(ctx)
 	if err != nil {
 		panic(err)
 	}
+
+	var deviceStore *store.Device
+
+	if len(devices) == 0 {
+		fmt.Println("Нет сохранённых сессий → создаём новую")
+		deviceStore = container.NewDevice()
+	} else {
+		fmt.Println("Найдена существующая сессия")
+		deviceStore = devices[0] // пока берём первую
+	}
+
 	clientLog := waLog.Stdout("Client", "INFO", true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 	client.AddEventHandler(eventHandler)
 
+	bot := &utils.MyBot{
+		WAClient: client,
+		JsonPath: os.Getenv("SENTENCES_PATH"),
+	}
+
 	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(context.Background())
+		qrChan, _ := client.GetQRChannel(ctx)
+
 		err = client.Connect()
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println("Wait QR...")
+
+		fmt.Println("Scan QR code:")
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
@@ -77,9 +93,18 @@ func main() {
 		}
 	}
 
+	go func() {
+		for {
+			bot.SendRandomText("79381248273")
+			time.Sleep(15 * time.Second)
+			break
+		}
+	}()
+
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 
 	client.Disconnect()
+	fmt.Println("Bot disconnected")
 }
