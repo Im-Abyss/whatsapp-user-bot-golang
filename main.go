@@ -15,7 +15,6 @@ import (
 	"my-whatsapp-bot/bot/utils"
 
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
@@ -51,46 +50,50 @@ func main() {
 		panic(err)
 	}
 
-	var deviceStore *store.Device
+	clientLog := waLog.Stdout("Client", "INFO", true)
+	clients := make([]*whatsmeow.Client, 0, len(devices))
 
 	if len(devices) == 0 {
 		fmt.Println("Нет сохранённых сессий → создаём новую")
-		deviceStore = container.NewDevice()
+		devices = append(devices, container.NewDevice())
 	} else {
-		fmt.Println("Найдена существующая сессия")
-		deviceStore = devices[0] // пока берём первую
+		fmt.Printf("Найдено существующих сессий: %d\n", len(devices))
 	}
 
-	clientLog := waLog.Stdout("Client", "INFO", true)
-	client := whatsmeow.NewClient(deviceStore, clientLog)
-	client.AddEventHandler(eventHandler)
+	for idx, deviceStore := range devices {
+		client := whatsmeow.NewClient(deviceStore, clientLog)
+		client.AddEventHandler(eventHandler)
+
+		if len(devices) == 1 && client.Store.ID == nil {
+			qrChan, _ := client.GetQRChannel(ctx)
+
+			err = client.Connect()
+			if err != nil {
+				panic(err)
+			}
+
+			fmt.Println("Scan QR code:")
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else {
+					fmt.Println("Login event:", evt.Event)
+				}
+			}
+		} else {
+			err = client.Connect()
+			if err != nil {
+				panic(err)
+			}
+			fmt.Printf("Клиент #%d подключен\n", idx+1)
+		}
+
+		clients = append(clients, client)
+	}
 
 	bot := &utils.MyBot{
-		WAClient: client,
+		WAClient: clients[0],
 		JsonPath: os.Getenv("SENTENCES_PATH"),
-	}
-
-	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(ctx)
-
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
-
-		fmt.Println("Scan QR code:")
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else {
-				fmt.Println("Login event:", evt.Event)
-			}
-		}
-	} else {
-		err = client.Connect()
-		if err != nil {
-			panic(err)
-		}
 	}
 
 	go func() {
@@ -105,6 +108,8 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 
-	client.Disconnect()
+	for _, client := range clients {
+		client.Disconnect()
+	}
 	fmt.Println("Bot disconnected")
 }
