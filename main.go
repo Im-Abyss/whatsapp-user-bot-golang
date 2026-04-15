@@ -34,6 +34,26 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	communicationDB, err := utils.InitCommunicationDB()
+	if err != nil {
+		panic(err)
+	}
+	defer communicationDB.Close()
+
+	today := time.Now().Format("2006-01-02")
+	disabledCount, err := utils.DisableExpiredCommunicationTasks(communicationDB, today)
+	if err != nil {
+		panic(err)
+	}
+	if disabledCount > 0 {
+		fmt.Printf("Отключено завершенных коммуникаций: %d\n", disabledCount)
+	}
+
+	activeTasks, err := utils.GetActiveCommunicationTasks(communicationDB, today)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("Активных коммуникаций на %s: %d\n", today, len(activeTasks))
 
 	ctx := context.Background()
 
