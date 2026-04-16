@@ -1,236 +1,291 @@
 package utils
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
-	"os"
+	"strconv"
+	"strings"
 	"time"
+
+	"google.golang.org/api/option"
+	"google.golang.org/api/sheets/v4"
 )
-
-const communicationsTableDDL = `
-CREATE TABLE IF NOT EXISTS communications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_1 INTEGER NOT NULL,
-    account_2 INTEGER NOT NULL,
-    start_date TEXT NOT NULL,
-    end_date TEXT NOT NULL,
-    is_enabled INTEGER NOT NULL DEFAULT 0 CHECK (is_enabled IN (0, 1)),
-    days_count INTEGER GENERATED ALWAYS AS (
-        CASE
-            WHEN julianday(end_date) >= julianday(start_date)
-                THEN CAST(julianday(end_date) - julianday(start_date) + 1 AS INTEGER)
-            ELSE 0
-        END
-    ) STORED,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CHECK (date(start_date) IS NOT NULL),
-    CHECK (date(end_date) IS NOT NULL)
-);
-
-CREATE TRIGGER IF NOT EXISTS communications_set_updated_at
-AFTER UPDATE ON communications
-FOR EACH ROW
-BEGIN
-    UPDATE communications
-    SET updated_at = CURRENT_TIMESTAMP
-    WHERE id = OLD.id;
-END;
-`
-
-func InitCommunicationDB() (*sql.DB, error) {
-	if err := os.MkdirAll("data", os.ModePerm); err != nil {
-		return nil, fmt.Errorf("failed to create data directory: %w", err)
-	}
-
-	db, err := sql.Open("sqlite3", "data/communications.db")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open communication db: %w", err)
-	}
-
-	if err = db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to connect communication db: %w", err)
-	}
-
-	if _, err = db.Exec(communicationsTableDDL); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to create communications schema: %w", err)
-	}
-
-	return db, nil
-}
 
 const communicationDateLayout = "2006-01-02"
 
+type Account struct {
+	AccountID int64
+	Phone     string
+}
+
 type CommunicationTask struct {
-	ID        int64
-	Account1  int64
-	Account2  int64
-	StartDate string
-	EndDate   string
-	IsEnabled bool
-	DaysCount int64
-	CreatedAt string
-	UpdatedAt string
+	TaskID     int64
+	AccountA   int64
+	AccountB   int64
+	StartDate  string
+	EndDate    string
+	Enabled    bool
+	CountDays  int64
+	SheetRowID int64
 }
 
-func InsertCommunicationTask(
-	db *sql.DB,
-	account1 int64,
-	account2 int64,
-	startDate string,
-	endDate string,
-	isEnabled bool,
-) (int64, error) {
-	if err := validateCommunicationDates(startDate, endDate); err != nil {
-		return 0, err
-	}
-
-	status := 0
-	if isEnabled {
-		status = 1
-	}
-
-	result, err := db.Exec(
-		`INSERT INTO communications (account_1, account_2, start_date, end_date, is_enabled)
-		 VALUES (?, ?, ?, ?, ?)`,
-		account1,
-		account2,
-		startDate,
-		endDate,
-		status,
+func InitGoogleSheetsService(ctx context.Context, credentialsPath string) (*sheets.Service, error) {
+	srv, err := sheets.NewService(ctx,
+		option.WithCredentialsFile(credentialsPath),
+		option.WithScopes(sheets.SpreadsheetsScope),
 	)
 	if err != nil {
-		return 0, fmt.Errorf("failed to insert communication task: %w", err)
+		return nil, fmt.Errorf("failed to initialize google sheets client: %w", err)
 	}
-
-	id, err := result.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch inserted communication task id: %w", err)
-	}
-
-	return id, nil
+	return srv, nil
 }
 
-func GetCommunicationTasks(db *sql.DB) ([]CommunicationTask, error) {
-	rows, err := db.Query(
-		`SELECT id, account_1, account_2, start_date, end_date, is_enabled, days_count, created_at, updated_at
-		 FROM communications
-		 ORDER BY id`,
-	)
+func GetAccounts(
+	ctx context.Context,
+	srv *sheets.Service,
+	spreadsheetID string,
+	sheetName string,
+) (map[int64]Account, error) {
+	resp, err := srv.Spreadsheets.Values.Get(spreadsheetID, sheetName+"!A:Z").Context(ctx).Do()
 	if err != nil {
-		return nil, fmt.Errorf("failed to query communication tasks: %w", err)
+		return nil, fmt.Errorf("failed to load accounts sheet: %w", err)
 	}
-	defer rows.Close()
+	if len(resp.Values) == 0 {
+		return nil, fmt.Errorf("accounts sheet %q is empty", sheetName)
+	}
 
-	tasks := make([]CommunicationTask, 0)
-	for rows.Next() {
-		task, err := scanCommunicationTask(rows)
+	headers := parseHeaders(resp.Values[0])
+	accountIDIdx, ok := headers["account_id"]
+	if !ok {
+		return nil, fmt.Errorf("accounts sheet %q must contain column account_id", sheetName)
+	}
+	phoneIdx, ok := headers["ph_number"]
+	if !ok {
+		return nil, fmt.Errorf("accounts sheet %q must contain column ph_number", sheetName)
+	}
+
+	accounts := make(map[int64]Account)
+	for row := 1; row < len(resp.Values); row++ {
+		line := resp.Values[row]
+		accountID, err := getIntCell(line, accountIDIdx)
 		if err != nil {
-			return nil, err
+			continue
 		}
-		tasks = append(tasks, task)
+		phone := getStringCell(line, phoneIdx)
+		if phone == "" {
+			continue
+		}
+		accounts[accountID] = Account{AccountID: accountID, Phone: normalizePhone(phone)}
 	}
 
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate communication tasks: %w", err)
+	return accounts, nil
+}
+
+func GetCommunicationTasks(
+	ctx context.Context,
+	srv *sheets.Service,
+	spreadsheetID string,
+	sheetName string,
+) ([]CommunicationTask, error) {
+	resp, err := srv.Spreadsheets.Values.Get(spreadsheetID, sheetName+"!A:Z").Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load communications sheet: %w", err)
+	}
+	if len(resp.Values) == 0 {
+		return nil, fmt.Errorf("communications sheet %q is empty", sheetName)
+	}
+
+	headers := parseHeaders(resp.Values[0])
+	taskIDIdx, ok := headers["task_id"]
+	if !ok {
+		return nil, fmt.Errorf("communications sheet %q must contain column task_id", sheetName)
+	}
+	accountAIdx, ok := headers["account_a"]
+	if !ok {
+		return nil, fmt.Errorf("communications sheet %q must contain column account_a", sheetName)
+	}
+	accountBIdx, ok := headers["account_b"]
+	if !ok {
+		return nil, fmt.Errorf("communications sheet %q must contain column account_b", sheetName)
+	}
+	startDateIdx, ok := headers["start_date"]
+	if !ok {
+		return nil, fmt.Errorf("communications sheet %q must contain column start_date", sheetName)
+	}
+	endDateIdx, ok := headers["end_date"]
+	if !ok {
+		return nil, fmt.Errorf("communications sheet %q must contain column end_date", sheetName)
+	}
+	enabledIdx, ok := headers["enabled"]
+	if !ok {
+		return nil, fmt.Errorf("communications sheet %q must contain column enabled", sheetName)
+	}
+	countDaysIdx, hasCountDays := headers["count_days"]
+
+	tasks := make([]CommunicationTask, 0, len(resp.Values)-1)
+	for row := 1; row < len(resp.Values); row++ {
+		line := resp.Values[row]
+		taskID, err := getIntCell(line, taskIDIdx)
+		if err != nil {
+			continue
+		}
+		accountA, err := getIntCell(line, accountAIdx)
+		if err != nil {
+			continue
+		}
+		accountB, err := getIntCell(line, accountBIdx)
+		if err != nil {
+			continue
+		}
+
+		startDate := getStringCell(line, startDateIdx)
+		endDate := getStringCell(line, endDateIdx)
+		if err := validateCommunicationDates(startDate, endDate); err != nil {
+			continue
+		}
+
+		task := CommunicationTask{
+			TaskID:     taskID,
+			AccountA:   accountA,
+			AccountB:   accountB,
+			StartDate:  startDate,
+			EndDate:    endDate,
+			Enabled:    parseBoolCell(line, enabledIdx),
+			CountDays:  calculateCountDays(startDate, endDate),
+			SheetRowID: int64(row + 1),
+		}
+		if hasCountDays {
+			if sheetCountDays, err := getIntCell(line, countDaysIdx); err == nil {
+				task.CountDays = sheetCountDays
+			}
+		}
+
+		tasks = append(tasks, task)
 	}
 
 	return tasks, nil
 }
 
-func GetActiveCommunicationTasks(db *sql.DB, date string) ([]CommunicationTask, error) {
-	if _, err := time.Parse(communicationDateLayout, date); err != nil {
-		return nil, fmt.Errorf("invalid date %q: expected %s", date, communicationDateLayout)
-	}
-
-	rows, err := db.Query(
-		`SELECT id, account_1, account_2, start_date, end_date, is_enabled, days_count, created_at, updated_at
-		 FROM communications
-		 WHERE start_date <= ? AND end_date >= ?
-		 ORDER BY id`,
-		date,
-		date,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query active communication tasks: %w", err)
-	}
-	defer rows.Close()
-
-	tasks := make([]CommunicationTask, 0)
-	for rows.Next() {
-		task, err := scanCommunicationTask(rows)
-		if err != nil {
-			return nil, err
-		}
-		tasks = append(tasks, task)
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate active communication tasks: %w", err)
-	}
-
-	return tasks, nil
-}
-
-func UpdateCommunicationStatus(db *sql.DB, taskID int64, isEnabled bool) error {
-	status := 0
-	if isEnabled {
-		status = 1
-	}
-
-	_, err := db.Exec(`UPDATE communications SET is_enabled = ? WHERE id = ?`, status, taskID)
-	if err != nil {
-		return fmt.Errorf("failed to update communication task status: %w", err)
-	}
-	return nil
-}
-
-func DisableExpiredCommunicationTasks(db *sql.DB, today string) (int64, error) {
+func DisableExpiredCommunicationTasks(
+	ctx context.Context,
+	srv *sheets.Service,
+	spreadsheetID string,
+	sheetName string,
+	today string,
+) (int, error) {
 	if _, err := time.Parse(communicationDateLayout, today); err != nil {
 		return 0, fmt.Errorf("invalid date %q: expected %s", today, communicationDateLayout)
 	}
 
-	result, err := db.Exec(
-		`UPDATE communications
-		 SET is_enabled = 0
-		 WHERE end_date < ? AND is_enabled = 1`,
-		today,
-	)
+	tasks, err := GetCommunicationTasks(ctx, srv, spreadsheetID, sheetName)
 	if err != nil {
-		return 0, fmt.Errorf("failed to disable expired communication tasks: %w", err)
+		return 0, err
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch affected rows for expired tasks update: %w", err)
+	updates := make([]*sheets.ValueRange, 0)
+	disabledCount := 0
+	for _, task := range tasks {
+		if !task.Enabled {
+			continue
+		}
+		if task.EndDate < today {
+			disabledCount++
+			updates = append(updates,
+				&sheets.ValueRange{Range: fmt.Sprintf("%s!F%d", sheetName, task.SheetRowID), Values: [][]interface{}{{"FALSE"}}},
+				&sheets.ValueRange{Range: fmt.Sprintf("%s!G%d", sheetName, task.SheetRowID), Values: [][]interface{}{{calculateCountDays(task.StartDate, task.EndDate)}}},
+			)
+		}
 	}
 
-	return affected, nil
+	if len(updates) == 0 {
+		return 0, nil
+	}
+
+	_, err = srv.Spreadsheets.Values.BatchUpdate(spreadsheetID, &sheets.BatchUpdateValuesRequest{
+		ValueInputOption: "USER_ENTERED",
+		Data:             updates,
+	}).Context(ctx).Do()
+	if err != nil {
+		return 0, fmt.Errorf("failed to update expired tasks in sheet: %w", err)
+	}
+
+	return disabledCount, nil
 }
 
-func scanCommunicationTask(scanner interface {
-	Scan(dest ...any) error
-}) (CommunicationTask, error) {
-	var task CommunicationTask
-	var enabled int
-	if err := scanner.Scan(
-		&task.ID,
-		&task.Account1,
-		&task.Account2,
-		&task.StartDate,
-		&task.EndDate,
-		&enabled,
-		&task.DaysCount,
-		&task.CreatedAt,
-		&task.UpdatedAt,
-	); err != nil {
-		return CommunicationTask{}, fmt.Errorf("failed to scan communication task: %w", err)
+func GetActiveCommunicationTasks(tasks []CommunicationTask, date string) ([]CommunicationTask, error) {
+	if _, err := time.Parse(communicationDateLayout, date); err != nil {
+		return nil, fmt.Errorf("invalid date %q: expected %s", date, communicationDateLayout)
 	}
 
-	task.IsEnabled = enabled == 1
-	return task, nil
+	active := make([]CommunicationTask, 0)
+	for _, task := range tasks {
+		if !task.Enabled {
+			continue
+		}
+		if task.StartDate <= date && task.EndDate >= date {
+			active = append(active, task)
+		}
+	}
+
+	return active, nil
+}
+
+func parseHeaders(headerRow []interface{}) map[string]int {
+	headers := make(map[string]int)
+	for idx, cell := range headerRow {
+		headers[strings.ToLower(strings.TrimSpace(fmt.Sprint(cell)))] = idx
+	}
+	return headers
+}
+
+func getStringCell(row []interface{}, idx int) string {
+	if idx < 0 || idx >= len(row) {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(row[idx]))
+}
+
+func getIntCell(row []interface{}, idx int) (int64, error) {
+	value := getStringCell(row, idx)
+	if value == "" {
+		return 0, fmt.Errorf("empty integer value")
+	}
+	number, err := strconv.ParseInt(value, 10, 64)
+	if err == nil {
+		return number, nil
+	}
+	floatValue, floatErr := strconv.ParseFloat(value, 64)
+	if floatErr != nil {
+		return 0, fmt.Errorf("invalid integer value %q", value)
+	}
+	return int64(floatValue), nil
+}
+
+func parseBoolCell(row []interface{}, idx int) bool {
+	value := strings.ToLower(getStringCell(row, idx))
+	return value == "true" || value == "1" || value == "yes"
+}
+
+func calculateCountDays(startDate string, endDate string) int64 {
+	start, err := time.Parse(communicationDateLayout, startDate)
+	if err != nil {
+		return 0
+	}
+	end, err := time.Parse(communicationDateLayout, endDate)
+	if err != nil || end.Before(start) {
+		return 0
+	}
+	return int64(end.Sub(start).Hours()/24) + 1
+}
+
+func normalizePhone(phone string) string {
+	builder := strings.Builder{}
+	for _, ch := range phone {
+		if ch >= '0' && ch <= '9' {
+			builder.WriteRune(ch)
+		}
+	}
+	return builder.String()
 }
 
 func validateCommunicationDates(startDate string, endDate string) error {
