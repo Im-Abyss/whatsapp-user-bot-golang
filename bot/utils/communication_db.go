@@ -212,6 +212,29 @@ func DisableExpiredCommunicationTasks(
 	return disabledCount, nil
 }
 
+func EnableCommunicationTask(
+	ctx context.Context,
+	srv *sheets.Service,
+	spreadsheetID string,
+	sheetName string,
+	task CommunicationTask,
+) error {
+	updates := []*sheets.ValueRange{
+		{Range: fmt.Sprintf("%s!F%d", sheetName, task.SheetRowID), Values: [][]interface{}{{"TRUE"}}},
+		{Range: fmt.Sprintf("%s!G%d", sheetName, task.SheetRowID), Values: [][]interface{}{{calculateCountDays(task.StartDate, task.EndDate)}}},
+	}
+
+	_, err := srv.Spreadsheets.Values.BatchUpdate(spreadsheetID, &sheets.BatchUpdateValuesRequest{
+		ValueInputOption: "USER_ENTERED",
+		Data:             updates,
+	}).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("failed to update task %d in sheet: %w", task.TaskID, err)
+	}
+
+	return nil
+}
+
 func GetActiveCommunicationTasks(tasks []CommunicationTask, date string) ([]CommunicationTask, error) {
 	if _, err := time.Parse(communicationDateLayout, date); err != nil {
 		return nil, fmt.Errorf("invalid date %q: expected %s", date, communicationDateLayout)
