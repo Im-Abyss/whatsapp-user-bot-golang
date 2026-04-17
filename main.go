@@ -44,6 +44,14 @@ type appContext struct {
 	clientsByAccountID  map[int64]*whatsmeow.Client
 }
 
+type sessionMappingReport struct {
+	TotalAccounts        int
+	TotalSessions        int
+	Mapped               int
+	UnmappedAccountIDs   []int64
+	UnmappedSessionPhone []string
+}
+
 func eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
@@ -137,8 +145,12 @@ func main() {
 		clients = append(clients, client)
 	}
 
-	clientsByAccountID := mapClientsToAccounts(accounts, clients)
-	fmt.Printf("Сопоставлено клиентов к аккаунтам: %d\n", len(clientsByAccountID))
+	clientsByAccountID, mappingReport := mapClientsToAccounts(accounts, clients)
+	printSessionMappingReport(mappingReport)
+
+	if envBoolOrDefault("REQUIRE_ALL_ACCOUNTS_MAPPED", false) && len(mappingReport.UnmappedAccountIDs) > 0 {
+		panic(fmt.Sprintf("не все account_id сопоставлены с сессиями WhatsApp: %v", mappingReport.UnmappedAccountIDs))
+	}
 
 	app := &appContext{
 		ctx:                 ctx,
@@ -340,9 +352,13 @@ func randomDuration(minMinutes, maxMinutes int) time.Duration {
 	return time.Duration(n) * time.Minute
 }
 
-func mapClientsToAccounts(accounts map[int64]utils.Account, clients []*whatsmeow.Client) map[int64]*whatsmeow.Client {
+func mapClientsToAccounts(accounts map[int64]utils.Account, clients []*whatsmeow.Client) (map[int64]*whatsmeow.Client, sessionMappingReport) {
 	result := make(map[int64]*whatsmeow.Client)
 	phoneToAccountID := make(map[string]int64)
+	report := sessionMappingReport{
+		TotalAccounts: len(accounts),
+		TotalSessions: len(clients),
+	}
 
 	for accountID, account := range accounts {
 		normalized := normalizePhone(account.Phone)
@@ -352,6 +368,7 @@ func mapClientsToAccounts(accounts map[int64]utils.Account, clients []*whatsmeow
 		phoneToAccountID[normalized] = accountID
 	}
 
+	matchedSessionPhone := make(map[string]bool)
 	for _, client := range clients {
 		if client.Store == nil || client.Store.ID == nil {
 			continue
@@ -359,10 +376,40 @@ func mapClientsToAccounts(accounts map[int64]utils.Account, clients []*whatsmeow
 		clientPhone := normalizePhone(client.Store.ID.User)
 		if accountID, ok := phoneToAccountID[clientPhone]; ok {
 			result[accountID] = client
+			matchedSessionPhone[clientPhone] = true
+			continue
+		}
+		report.UnmappedSessionPhone = append(report.UnmappedSessionPhone, clientPhone)
+	}
+
+	for accountID, account := range accounts {
+		accountPhone := normalizePhone(account.Phone)
+		if accountPhone == "" {
+			report.UnmappedAccountIDs = append(report.UnmappedAccountIDs, accountID)
+			continue
+		}
+		if !matchedSessionPhone[accountPhone] {
+			report.UnmappedAccountIDs = append(report.UnmappedAccountIDs, accountID)
 		}
 	}
 
-	return result
+	report.Mapped = len(result)
+	return result, report
+}
+
+func printSessionMappingReport(report sessionMappingReport) {
+	fmt.Printf(
+		"Сопоставление сессий: аккаунтов=%d, сессий=%d, сопоставлено=%d\n",
+		report.TotalAccounts,
+		report.TotalSessions,
+		report.Mapped,
+	)
+	if len(report.UnmappedAccountIDs) > 0 {
+		fmt.Printf("Не найдено сессий для account_id: %v\n", report.UnmappedAccountIDs)
+	}
+	if len(report.UnmappedSessionPhone) > 0 {
+		fmt.Printf("Найдены сессии без account_id в таблице accounts (по номеру): %v\n", report.UnmappedSessionPhone)
+	}
 }
 
 func normalizePhone(phone string) string {
@@ -393,4 +440,19 @@ func envIntOrDefault(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }
